@@ -9,12 +9,14 @@ import { ProxyAgent, fetch as undiciFetch } from "undici";
 export class TranscriptError extends Error {
   code: TranscriptErrorCode;
   suggestion?: string;
+  debug?: Record<string, any>;
 
-  constructor(code: TranscriptErrorCode, message: string, suggestion?: string) {
+  constructor(code: TranscriptErrorCode, message: string, suggestion?: string, debug?: Record<string, any>) {
     super(message);
     this.name = "TranscriptError";
     this.code = code;
     this.suggestion = suggestion;
+    this.debug = debug;
   }
 }
 
@@ -169,6 +171,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
   async getTranscript(videoId: string, languageCode?: string): Promise<NormalizedTranscript> {
     let rawItems: RawTranscriptItem[] = [];
     let detectedLang = languageCode || "en";
+    const traces: string[] = [];
 
     // ----------------------------------------------------
     // Tier 1: Direct InnerTube (Fast Direct Connection)
@@ -179,9 +182,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
       if (innerTubeItems && innerTubeItems.items.length > 0) {
         rawItems = innerTubeItems.items;
         detectedLang = innerTubeItems.lang;
+        traces.push("Tier 1 (Direct InnerTube): SUCCESS");
+      } else {
+        traces.push("Tier 1 (Direct InnerTube): No tracks returned");
       }
     } catch (e: any) {
-      console.log(`[Transcript Tier 1] Direct InnerTube failed: ${e?.message}`);
+      traces.push(`Tier 1 (Direct InnerTube): ${e?.message || "Failed"}`);
     }
 
     // ----------------------------------------------------
@@ -201,9 +207,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
             lang: item.lang || languageCode || "en",
           }));
           detectedLang = transcriptData[0]?.lang || languageCode || "en";
+          traces.push("Tier 2 (youtube-transcript): SUCCESS");
+        } else {
+          traces.push("Tier 2 (youtube-transcript): Empty items");
         }
       } catch (libErr: any) {
-        console.log(`[Transcript Tier 2] youtube-transcript direct failed: ${libErr?.message}`);
+        traces.push(`Tier 2 (youtube-transcript): ${libErr?.message || "Failed"}`);
       }
     }
 
@@ -218,9 +227,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
         if (proxyItems && proxyItems.items.length > 0) {
           rawItems = proxyItems.items;
           detectedLang = proxyItems.lang;
+          traces.push("Tier 3 (Proxy InnerTube): SUCCESS");
+        } else {
+          traces.push("Tier 3 (Proxy InnerTube): No tracks returned");
         }
       } catch (proxyErr: any) {
-        console.log(`[Transcript Tier 3] Proxy InnerTube failed: ${proxyErr?.message}`);
+        traces.push(`Tier 3 (Proxy InnerTube): ${proxyErr?.message || "Failed"}`);
       }
     }
 
@@ -235,9 +247,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
           if (rapidItems && rapidItems.items.length > 0) {
             rawItems = rapidItems.items;
             detectedLang = rapidItems.lang;
+            traces.push("Tier 4 (RapidAPI): SUCCESS");
+          } else {
+            traces.push("Tier 4 (RapidAPI): Empty response");
           }
         } catch (rapidErr: any) {
-          console.log(`[Transcript Tier 4] RapidAPI failed: ${rapidErr?.message}`);
+          traces.push(`Tier 4 (RapidAPI): ${rapidErr?.message || "Failed"}`);
         }
       }
     }
@@ -262,10 +277,15 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
         console.log("[Transcript Tier 5] Engaging Groq Whisper AI Speech-to-Text fallback...");
         const { SpeechToTextFallbackProvider } = await import("./speech-to-text-provider");
         const sttProvider = new SpeechToTextFallbackProvider();
-        return await sttProvider.transcribeVideo(videoId, languageCode);
+        const result = await sttProvider.transcribeVideo(videoId, languageCode);
+        traces.push("Tier 5 (Groq STT): SUCCESS");
+        return result;
       } catch (sttErr: any) {
+        traces.push(`Tier 5 (Groq STT): ${sttErr?.message || "Failed"}`);
         console.error("[Transcript Tier 5] Groq Whisper fallback error:", sttErr?.message || sttErr);
       }
+    } else {
+      traces.push("Tier 5 (Groq STT): SKIPPED (GROQ_API_KEY not configured in environment)");
     }
 
     // ----------------------------------------------------
@@ -279,7 +299,13 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
     throw new TranscriptError(
       "CAPTIONS_DISABLED",
       "Transcripts or captions are currently unavailable for this video.",
-      suggestion
+      suggestion,
+      {
+        hasGroqKey,
+        hasProxy,
+        hasRapidApiKey: Boolean(process.env.RAPIDAPI_KEY || process.env.YOUTUBE_API_KEY),
+        traces,
+      }
     );
   }
 

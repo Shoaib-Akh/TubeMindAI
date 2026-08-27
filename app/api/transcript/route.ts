@@ -67,6 +67,7 @@ export async function POST(req: NextRequest) {
           code: err.code,
           message: err.message,
           suggestion: err.suggestion,
+          debug: err.debug,
         },
         { status: 422 }
       );
