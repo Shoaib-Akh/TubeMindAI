@@ -43,10 +43,13 @@ export function normalizeTranscript(
     };
   }
 
+  // Detect if units are in milliseconds (subtitle duration in seconds is rarely > 50s)
+  const isMs = rawItems.some((item) => typeof item.duration === "number" && item.duration > 50);
+
   const segments: TranscriptSegment[] = [];
   let prevText = "";
 
-  rawItems.forEach((item, index) => {
+  rawItems.forEach((item) => {
     let text = decodeHtmlEntities(item.text || "")
       .replace(/\s+/g, " ")
       .replace(/\[Music\]/gi, "")
@@ -59,9 +62,12 @@ export function normalizeTranscript(
     // Remove exact duplicate consecutive fragments often sent by YouTube ASR
     if (text === prevText) return;
 
-    // Compute offset in seconds (some libraries give milliseconds or seconds)
-    const startTime = typeof item.offset === "number" ? (item.offset > 100000 ? item.offset / 1000 : item.offset) : 0;
-    const duration = typeof item.duration === "number" ? (item.duration > 100000 ? item.duration / 1000 : item.duration) : 2.5;
+    // Convert to seconds
+    const rawOffset = typeof item.offset === "number" ? item.offset : 0;
+    const rawDuration = typeof item.duration === "number" ? item.duration : (isMs ? 2500 : 2.5);
+
+    const startTime = isMs ? rawOffset / 1000 : rawOffset;
+    const duration = isMs ? rawDuration / 1000 : rawDuration;
     const endTime = startTime + duration;
 
     segments.push({
