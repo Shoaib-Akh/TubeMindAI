@@ -21,24 +21,34 @@ export class TranscriptError extends Error {
 /**
  * Returns a fetch function configured with proxy if YOUTUBE_PROXY or HTTPS_PROXY is present
  */
-export function getCustomFetch(): typeof fetch {
+export function getCustomFetch(useProxyIfAvailable: boolean = true): typeof fetch {
   const proxyUrl =
-    process.env.YOUTUBE_PROXY ||
-    process.env.HTTPS_PROXY ||
-    process.env.HTTP_PROXY ||
-    process.env.PROXY_URL;
+    useProxyIfAvailable
+      ? process.env.YOUTUBE_PROXY ||
+        process.env.HTTPS_PROXY ||
+        process.env.HTTP_PROXY ||
+        process.env.PROXY_URL
+      : null;
 
   if (proxyUrl) {
     try {
       const dispatcher = new ProxyAgent(proxyUrl);
       return ((url: any, init?: any) =>
-        undiciFetch(url, { ...init, dispatcher })) as unknown as typeof fetch;
+        undiciFetch(url, {
+          ...init,
+          dispatcher,
+          signal: init?.signal || AbortSignal.timeout(6000),
+        })) as unknown as typeof fetch;
     } catch (e) {
       console.warn("[Transcript] Failed to initialize ProxyAgent:", e);
     }
   }
 
-  return fetch;
+  return ((url: any, init?: any) =>
+    fetch(url, {
+      ...init,
+      signal: init?.signal || AbortSignal.timeout(5000),
+    })) as typeof fetch;
 }
 
 export class YouTubeTranscriptProvider implements ITranscriptProvider {
@@ -48,7 +58,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
   async getVideoMetadata(videoId: string): Promise<YouTubeVideoMetadata> {
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
     const defaultThumbnail = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
-    const customFetch = getCustomFetch();
+    const directFetch = getCustomFetch(false);
 
     let title = "YouTube Video";
     let channelName = "YouTube Creator";
@@ -58,9 +68,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
 
     // 1. Fetch official oEmbed data
     try {
-      const oembedRes = await customFetch(
+      const oembedRes = await directFetch(
         `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`,
-        { headers: { "User-Agent": "Mozilla/5.0 (compatible; TubeMindBot/1.0)" } }
+        {
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; TubeMindBot/1.0)" },
+          signal: AbortSignal.timeout(3000),
+        }
       );
 
       if (oembedRes.ok) {
@@ -76,9 +89,9 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
       // Fallback
     }
 
-    // 2. Fetch Innertube video details (duration & verified title)
+    // 2. Fetch Innertube video details
     try {
-      const innertubeRes = await customFetch("https://www.youtube.com/youtubei/v1/player", {
+      const innertubeRes = await directFetch("https://www.youtube.com/youtubei/v1/player", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -97,6 +110,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
           },
           videoId,
         }),
+        signal: AbortSignal.timeout(3000),
       });
 
       if (innertubeRes.ok) {
@@ -145,37 +159,37 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
   }
 
   /**
-   * Primary transcript retriever with Multi-Tier Fallback:
-   * Tier 1: Direct InnerTube Android/iOS/Web TimedText (with proxy support)
-   * Tier 2: youtube-transcript package (with custom fetch & proxy)
-   * Tier 3: RapidAPI YouTube Transcript API (if configured in env)
-   * Tier 4: Groq Whisper AI Speech-to-Text Fallback
+   * Primary transcript retriever with Multi-Tier Fast Fallback:
+   * Tier 1: Direct InnerTube (Direct connection)
+   * Tier 2: youtube-transcript Library
+   * Tier 3: InnerTube with Proxy (if configured)
+   * Tier 4: RapidAPI YouTube Transcript API (if configured)
+   * Tier 5: Groq Whisper AI Speech-to-Text Fallback
    */
   async getTranscript(videoId: string, languageCode?: string): Promise<NormalizedTranscript> {
     let rawItems: RawTranscriptItem[] = [];
     let detectedLang = languageCode || "en";
-    const customFetch = getCustomFetch();
 
     // ----------------------------------------------------
-    // Tier 1: Direct InnerTube Multi-Client Extraction
+    // Tier 1: Direct InnerTube (Fast Direct Connection)
     // ----------------------------------------------------
     try {
-      const innerTubeItems = await this.fetchFromInnerTubeDirect(videoId, languageCode, customFetch);
+      const directFetch = getCustomFetch(false);
+      const innerTubeItems = await this.fetchFromInnerTubeDirect(videoId, languageCode, directFetch);
       if (innerTubeItems && innerTubeItems.items.length > 0) {
         rawItems = innerTubeItems.items;
         detectedLang = innerTubeItems.lang;
       }
     } catch (e: any) {
-      console.log(`[Transcript Tier 1] InnerTube Direct failed (${e?.message}). Trying Tier 2...`);
+      console.log(`[Transcript Tier 1] Direct InnerTube failed: ${e?.message}`);
     }
 
     // ----------------------------------------------------
-    // Tier 2: youtube-transcript Library
+    // Tier 2: youtube-transcript Library (Direct)
     // ----------------------------------------------------
     if (rawItems.length === 0) {
       try {
         const transcriptData = await YoutubeTranscript.fetchTranscript(videoId, {
-          fetch: customFetch as any,
           ...(languageCode && languageCode !== "auto" ? { lang: languageCode } : {}),
         });
 
@@ -189,12 +203,29 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
           detectedLang = transcriptData[0]?.lang || languageCode || "en";
         }
       } catch (libErr: any) {
-        console.log(`[Transcript Tier 2] youtube-transcript failed (${libErr?.message}). Trying Tier 3...`);
+        console.log(`[Transcript Tier 2] youtube-transcript direct failed: ${libErr?.message}`);
       }
     }
 
     // ----------------------------------------------------
-    // Tier 3: RapidAPI YouTube Transcript API Fallback
+    // Tier 3: Proxy InnerTube (If proxy configured)
+    // ----------------------------------------------------
+    const hasProxy = Boolean(process.env.YOUTUBE_PROXY || process.env.HTTPS_PROXY);
+    if (rawItems.length === 0 && hasProxy) {
+      try {
+        const proxyFetch = getCustomFetch(true);
+        const proxyItems = await this.fetchFromInnerTubeDirect(videoId, languageCode, proxyFetch);
+        if (proxyItems && proxyItems.items.length > 0) {
+          rawItems = proxyItems.items;
+          detectedLang = proxyItems.lang;
+        }
+      } catch (proxyErr: any) {
+        console.log(`[Transcript Tier 3] Proxy InnerTube failed: ${proxyErr?.message}`);
+      }
+    }
+
+    // ----------------------------------------------------
+    // Tier 4: RapidAPI YouTube Transcript API Fallback
     // ----------------------------------------------------
     if (rawItems.length === 0) {
       const rapidApiKey = process.env.RAPIDAPI_KEY || process.env.YOUTUBE_API_KEY;
@@ -206,12 +237,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
             detectedLang = rapidItems.lang;
           }
         } catch (rapidErr: any) {
-          console.log(`[Transcript Tier 3] RapidAPI failed (${rapidErr?.message}). Trying Tier 4...`);
+          console.log(`[Transcript Tier 4] RapidAPI failed: ${rapidErr?.message}`);
         }
       }
     }
 
-    // If any caption fetcher succeeded, normalize and return
+    // If any caption fetcher succeeded, normalize and return immediately
     if (rawItems && rawItems.length > 0) {
       return normalizeTranscript(
         rawItems,
@@ -223,24 +254,24 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
     }
 
     // ----------------------------------------------------
-    // Tier 4: Groq Whisper AI Fallback
+    // Tier 5: Groq Whisper AI Fallback
     // ----------------------------------------------------
     const hasGroqKey = Boolean(process.env.GROQ_API_KEY || process.env.STT_API_KEY);
     if (hasGroqKey) {
       try {
-        console.log("[Transcript Tier 4] Engaging Groq Whisper AI Speech-to-Text fallback...");
+        console.log("[Transcript Tier 5] Engaging Groq Whisper AI Speech-to-Text fallback...");
         const { SpeechToTextFallbackProvider } = await import("./speech-to-text-provider");
         const sttProvider = new SpeechToTextFallbackProvider();
         return await sttProvider.transcribeVideo(videoId, languageCode);
       } catch (sttErr: any) {
-        console.error("[Transcript Tier 4] Groq Whisper fallback error:", sttErr?.message || sttErr);
+        console.error("[Transcript Tier 5] Groq Whisper fallback error:", sttErr?.message || sttErr);
       }
     }
 
     // ----------------------------------------------------
     // If all tiers failed, provide a helpful actionable error
     // ----------------------------------------------------
-    const isDatacenterIpBlock = !process.env.YOUTUBE_PROXY && !hasGroqKey;
+    const isDatacenterIpBlock = !hasProxy && !hasGroqKey;
     const suggestion = isDatacenterIpBlock
       ? "YouTube blocks serverless cloud IPs (Vercel). Please add GROQ_API_KEY or YOUTUBE_PROXY in your Vercel Environment Variables to bypass this block."
       : "Try another video with closed captions or spoken audio enabled.";
@@ -297,6 +328,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
             },
             videoId,
           }),
+          signal: AbortSignal.timeout(4000),
         });
 
         if (!response.ok) continue;
@@ -317,7 +349,14 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
         if (!selectedTrack?.baseUrl) continue;
 
         // Fetch TimedText XML
-        const captionRes = await customFetch(selectedTrack.baseUrl);
+        const captionRes = await customFetch(selectedTrack.baseUrl, {
+          headers: {
+            "User-Agent": client.userAgent,
+            "Accept": "*/*",
+          },
+          signal: AbortSignal.timeout(4000),
+        });
+
         if (!captionRes.ok) continue;
 
         const xml = await captionRes.text();
@@ -406,6 +445,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
           "x-rapidapi-key": apiKey,
           "x-rapidapi-host": "youtube-transcriptor.p.rapidapi.com",
         },
+        signal: AbortSignal.timeout(4000),
       });
 
       if (res.ok) {
