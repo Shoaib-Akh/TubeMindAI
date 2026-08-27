@@ -11,7 +11,7 @@ export interface BlogPost {
 
 export const BLOG_POSTS: BlogPost[] = [
   {
-    slug: "how-to-get-a-youtube-transcript",
+    slug: "how-to-get-a -youtube-transcript",
     title: "How to Get a YouTube Transcript in 3 Easy Ways (2026 Guide)",
     excerpt: "Learn how to extract, view, and copy transcripts from any YouTube video on desktop, mobile, and using TubeMind AI.",
     readTime: "4 min read",
