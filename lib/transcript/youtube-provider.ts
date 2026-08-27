@@ -1,9 +1,10 @@
 import { ITranscriptProvider } from "./types";
 import { YouTubeVideoMetadata } from "@/types/youtube";
 import { NormalizedTranscript, RawTranscriptItem, TranscriptErrorCode } from "@/types/transcript";
-import { normalizeTranscript } from "./normalizer";
+import { normalizeTranscript, decodeHtmlEntities } from "./normalizer";
 import { formatDuration } from "@/lib/utils";
 import { YoutubeTranscript } from "youtube-transcript";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 export class TranscriptError extends Error {
   code: TranscriptErrorCode;
@@ -17,6 +18,29 @@ export class TranscriptError extends Error {
   }
 }
 
+/**
+ * Returns a fetch function configured with proxy if YOUTUBE_PROXY or HTTPS_PROXY is present
+ */
+export function getCustomFetch(): typeof fetch {
+  const proxyUrl =
+    process.env.YOUTUBE_PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.HTTP_PROXY ||
+    process.env.PROXY_URL;
+
+  if (proxyUrl) {
+    try {
+      const dispatcher = new ProxyAgent(proxyUrl);
+      return ((url: any, init?: any) =>
+        undiciFetch(url, { ...init, dispatcher })) as unknown as typeof fetch;
+    } catch (e) {
+      console.warn("[Transcript] Failed to initialize ProxyAgent:", e);
+    }
+  }
+
+  return fetch;
+}
+
 export class YouTubeTranscriptProvider implements ITranscriptProvider {
   /**
    * Fetch Video Metadata using YouTube oEmbed and Innertube API
@@ -24,6 +48,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
   async getVideoMetadata(videoId: string): Promise<YouTubeVideoMetadata> {
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
     const defaultThumbnail = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+    const customFetch = getCustomFetch();
 
     let title = "YouTube Video";
     let channelName = "YouTube Creator";
@@ -33,13 +58,13 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
 
     // 1. Fetch official oEmbed data
     try {
-      const oembedRes = await fetch(
+      const oembedRes = await customFetch(
         `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`,
         { headers: { "User-Agent": "Mozilla/5.0 (compatible; TubeMindBot/1.0)" } }
       );
 
       if (oembedRes.ok) {
-        const oembed = await oembedRes.json();
+        const oembed: any = await oembedRes.json();
         title = oembed.title || title;
         channelName = oembed.author_name || channelName;
         channelUrl = oembed.author_url;
@@ -53,7 +78,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
 
     // 2. Fetch Innertube video details (duration & verified title)
     try {
-      const innertubeRes = await fetch("https://www.youtube.com/youtubei/v1/player", {
+      const innertubeRes = await customFetch("https://www.youtube.com/youtubei/v1/player", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -75,7 +100,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
       });
 
       if (innertubeRes.ok) {
-        const data = await innertubeRes.json();
+        const data: any = await innertubeRes.json();
         if (data.videoDetails) {
           title = data.videoDetails.title || title;
           channelName = data.videoDetails.author || channelName;
@@ -120,49 +145,73 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
   }
 
   /**
-   * Primary transcript retriever with robust multi-language and Groq Whisper fallback
+   * Primary transcript retriever with Multi-Tier Fallback:
+   * Tier 1: Direct InnerTube Android/iOS/Web TimedText (with proxy support)
+   * Tier 2: youtube-transcript package (with custom fetch & proxy)
+   * Tier 3: RapidAPI YouTube Transcript API (if configured in env)
+   * Tier 4: Groq Whisper AI Speech-to-Text Fallback
    */
   async getTranscript(videoId: string, languageCode?: string): Promise<NormalizedTranscript> {
     let rawItems: RawTranscriptItem[] = [];
     let detectedLang = languageCode || "en";
+    const customFetch = getCustomFetch();
 
-    // 1. Try fetching with requested language (if provided)
-    if (languageCode && languageCode !== "auto") {
-      try {
-        const transcriptData = await YoutubeTranscript.fetchTranscript(videoId, { lang: languageCode });
-        if (transcriptData && transcriptData.length > 0) {
-          rawItems = transcriptData.map((item) => ({
-            text: item.text,
-            duration: item.duration,
-            offset: item.offset,
-            lang: item.lang || languageCode,
-          }));
-          detectedLang = transcriptData[0]?.lang || languageCode;
-        }
-      } catch (langErr) {
-        console.log(`[Transcript] Language ${languageCode} not found on YouTube. Trying default available language...`);
+    // ----------------------------------------------------
+    // Tier 1: Direct InnerTube Multi-Client Extraction
+    // ----------------------------------------------------
+    try {
+      const innerTubeItems = await this.fetchFromInnerTubeDirect(videoId, languageCode, customFetch);
+      if (innerTubeItems && innerTubeItems.items.length > 0) {
+        rawItems = innerTubeItems.items;
+        detectedLang = innerTubeItems.lang;
       }
+    } catch (e: any) {
+      console.log(`[Transcript Tier 1] InnerTube Direct failed (${e?.message}). Trying Tier 2...`);
     }
 
-    // 2. If not found or no specific language, fetch default/any available transcript on video
+    // ----------------------------------------------------
+    // Tier 2: youtube-transcript Library
+    // ----------------------------------------------------
     if (rawItems.length === 0) {
       try {
-        const transcriptData = await YoutubeTranscript.fetchTranscript(videoId);
+        const transcriptData = await YoutubeTranscript.fetchTranscript(videoId, {
+          fetch: customFetch as any,
+          ...(languageCode && languageCode !== "auto" ? { lang: languageCode } : {}),
+        });
+
         if (transcriptData && transcriptData.length > 0) {
           rawItems = transcriptData.map((item) => ({
             text: item.text,
             duration: item.duration,
             offset: item.offset,
-            lang: item.lang || "auto",
+            lang: item.lang || languageCode || "en",
           }));
-          detectedLang = transcriptData[0]?.lang || "en";
+          detectedLang = transcriptData[0]?.lang || languageCode || "en";
         }
-      } catch (defaultErr: any) {
-        console.log(`[Transcript] Direct YouTube captions unavailable (${defaultErr?.message}). Engaging Groq Whisper AI fallback...`);
+      } catch (libErr: any) {
+        console.log(`[Transcript Tier 2] youtube-transcript failed (${libErr?.message}). Trying Tier 3...`);
       }
     }
 
-    // 3. If YouTube captions returned items, normalize and return immediately
+    // ----------------------------------------------------
+    // Tier 3: RapidAPI YouTube Transcript API Fallback
+    // ----------------------------------------------------
+    if (rawItems.length === 0) {
+      const rapidApiKey = process.env.RAPIDAPI_KEY || process.env.YOUTUBE_API_KEY;
+      if (rapidApiKey) {
+        try {
+          const rapidItems = await this.fetchFromRapidApi(videoId, languageCode, rapidApiKey);
+          if (rapidItems && rapidItems.items.length > 0) {
+            rawItems = rapidItems.items;
+            detectedLang = rapidItems.lang;
+          }
+        } catch (rapidErr: any) {
+          console.log(`[Transcript Tier 3] RapidAPI failed (${rapidErr?.message}). Trying Tier 4...`);
+        }
+      }
+    }
+
+    // If any caption fetcher succeeded, normalize and return
     if (rawItems && rawItems.length > 0) {
       return normalizeTranscript(
         rawItems,
@@ -173,20 +222,208 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
       );
     }
 
-    // 4. Fallback to Groq Whisper AI (When captions are completely disabled on YouTube)
-    try {
-      const { SpeechToTextFallbackProvider } = await import("./speech-to-text-provider");
-      const sttProvider = new SpeechToTextFallbackProvider();
-      return await sttProvider.transcribeVideo(videoId, languageCode);
-    } catch (sttErr: any) {
-      console.error("[Transcript] Groq Whisper AI fallback error:", sttErr);
-
-      throw new TranscriptError(
-        "CAPTIONS_DISABLED",
-        "Transcripts or captions are disabled for this video by the creator.",
-        "Try a video with closed captions or spoken audio enabled."
-      );
+    // ----------------------------------------------------
+    // Tier 4: Groq Whisper AI Fallback
+    // ----------------------------------------------------
+    const hasGroqKey = Boolean(process.env.GROQ_API_KEY || process.env.STT_API_KEY);
+    if (hasGroqKey) {
+      try {
+        console.log("[Transcript Tier 4] Engaging Groq Whisper AI Speech-to-Text fallback...");
+        const { SpeechToTextFallbackProvider } = await import("./speech-to-text-provider");
+        const sttProvider = new SpeechToTextFallbackProvider();
+        return await sttProvider.transcribeVideo(videoId, languageCode);
+      } catch (sttErr: any) {
+        console.error("[Transcript Tier 4] Groq Whisper fallback error:", sttErr?.message || sttErr);
+      }
     }
+
+    // ----------------------------------------------------
+    // If all tiers failed, provide a helpful actionable error
+    // ----------------------------------------------------
+    const isDatacenterIpBlock = !process.env.YOUTUBE_PROXY && !hasGroqKey;
+    const suggestion = isDatacenterIpBlock
+      ? "YouTube blocks serverless cloud IPs (Vercel). Please add GROQ_API_KEY or YOUTUBE_PROXY in your Vercel Environment Variables to bypass this block."
+      : "Try another video with closed captions or spoken audio enabled.";
+
+    throw new TranscriptError(
+      "CAPTIONS_DISABLED",
+      "Transcripts or captions are currently unavailable for this video.",
+      suggestion
+    );
+  }
+
+  /**
+   * Directly queries InnerTube with multiple client headers (Android, iOS, Web) and parses TimedText XML
+   */
+  private async fetchFromInnerTubeDirect(
+    videoId: string,
+    requestedLang: string | undefined,
+    customFetch: typeof fetch
+  ): Promise<{ items: RawTranscriptItem[]; lang: string } | null> {
+    const clients = [
+      {
+        clientName: "ANDROID",
+        clientVersion: "20.10.38",
+        userAgent: "com.google.android.youtube/20.10.38 (Linux; U; Android 14)",
+      },
+      {
+        clientName: "IOS",
+        clientVersion: "19.45.4",
+        userAgent: "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU OS 17_5_1 like Mac OS X)",
+      },
+      {
+        clientName: "WEB",
+        clientVersion: "2.20240313.01.00",
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      },
+    ];
+
+    for (const client of clients) {
+      try {
+        const response = await customFetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": client.userAgent,
+          },
+          body: JSON.stringify({
+            context: {
+              client: {
+                clientName: client.clientName,
+                clientVersion: client.clientVersion,
+                hl: requestedLang && requestedLang !== "auto" ? requestedLang : "en",
+                gl: "US",
+              },
+            },
+            videoId,
+          }),
+        });
+
+        if (!response.ok) continue;
+
+        const data: any = await response.json();
+        const captionTracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
+          continue;
+        }
+
+        // Find track matching requested language or pick the first available
+        let selectedTrack = captionTracks[0];
+        if (requestedLang && requestedLang !== "auto") {
+          const match = captionTracks.find((t) => t.languageCode === requestedLang);
+          if (match) selectedTrack = match;
+        }
+
+        if (!selectedTrack?.baseUrl) continue;
+
+        // Fetch TimedText XML
+        const captionRes = await customFetch(selectedTrack.baseUrl);
+        if (!captionRes.ok) continue;
+
+        const xml = await captionRes.text();
+        const items = this.parseTimedTextXml(xml, selectedTrack.languageCode || "en");
+
+        if (items.length > 0) {
+          return { items, lang: selectedTrack.languageCode || "en" };
+        }
+      } catch (e) {
+        // Try next client
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Parse TimedText XML supporting both srv3 format (<p t="ms" d="ms">) and classic format (<text start="s" dur="s">)
+   */
+  private parseTimedTextXml(xml: string, lang: string): RawTranscriptItem[] {
+    const items: RawTranscriptItem[] = [];
+
+    // Format 1: srv3 (<p t="ms" d="ms"><s>word</s></p>)
+    const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
+    let match;
+    while ((match = pRegex.exec(xml)) !== null) {
+      const startMs = parseInt(match[1], 10);
+      const durMs = parseInt(match[2], 10);
+      const inner = match[3];
+
+      let text = "";
+      const sRegex = /<s[^>]*>([^<]*)<\/s>/g;
+      let sMatch;
+      while ((sMatch = sRegex.exec(inner)) !== null) {
+        text += sMatch[1];
+      }
+      if (!text) {
+        text = inner.replace(/<[^>]+>/g, "");
+      }
+      text = decodeHtmlEntities(text).trim();
+
+      if (text) {
+        items.push({
+          text,
+          offset: startMs,
+          duration: durMs,
+          lang,
+        });
+      }
+    }
+
+    if (items.length > 0) return items;
+
+    // Format 2: Classic (<text start="12.34" dur="5.67">Content</text>)
+    const textRegex = /<text\s+start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>([^<]*)<\/text>/g;
+    while ((match = textRegex.exec(xml)) !== null) {
+      const startSec = parseFloat(match[1]);
+      const durSec = parseFloat(match[2]);
+      const content = decodeHtmlEntities(match[3]).trim();
+
+      if (content) {
+        items.push({
+          text: content,
+          offset: Math.round(startSec * 1000),
+          duration: Math.round(durSec * 1000),
+          lang,
+        });
+      }
+    }
+
+    return items;
+  }
+
+  /**
+   * RapidAPI YouTube Transcript API Fallback
+   */
+  private async fetchFromRapidApi(
+    videoId: string,
+    languageCode: string | undefined,
+    apiKey: string
+  ): Promise<{ items: RawTranscriptItem[]; lang: string } | null> {
+    try {
+      const url = `https://youtube-transcriptor.p.rapidapi.com/transcript?video_id=${videoId}&lang=${languageCode || "en"}`;
+      const res = await fetch(url, {
+        headers: {
+          "x-rapidapi-key": apiKey,
+          "x-rapidapi-host": "youtube-transcriptor.p.rapidapi.com",
+        },
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          const items: RawTranscriptItem[] = data.map((d: any) => ({
+            text: d.text || d.subtitle || "",
+            offset: typeof d.start === "number" ? Math.round(d.start * 1000) : (d.offset || 0),
+            duration: typeof d.duration === "number" ? Math.round(d.duration * 1000) : (d.duration || 2500),
+            lang: languageCode || "en",
+          }));
+          return { items, lang: languageCode || "en" };
+        }
+      }
+    } catch (e) {
+      // RapidAPI fallback failed
+    }
+    return null;
   }
 
   private getLanguageName(code: string): string {
