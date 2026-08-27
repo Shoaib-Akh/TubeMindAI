@@ -6,6 +6,8 @@ import { AI_ANALYSIS_SYSTEM_PROMPT, SCRIPT_GENERATION_PROMPTS } from "./prompts"
 import { chunkTranscript } from "./chunking";
 import { aiCache } from "@/lib/cache/ai-cache";
 
+import Groq from "groq-sdk";
+
 export interface IAIProvider {
   generateAnalysis(transcript: NormalizedTranscript, metadata?: YouTubeVideoMetadata, targetLanguage?: string): Promise<VideoAnalysisResult>;
   generateScript(transcript: NormalizedTranscript, scriptType: ScriptType, metadata?: YouTubeVideoMetadata, targetLanguage?: string): Promise<GeneratedScript>;
@@ -22,10 +24,15 @@ export interface IAIProvider {
 export class AIProvider implements IAIProvider {
   private openAiKey?: string;
   private geminiKey?: string;
+  private groq?: Groq;
 
   constructor() {
     this.openAiKey = process.env.OPENAI_API_KEY;
     this.geminiKey = process.env.GEMINI_API_KEY;
+    const groqKey = process.env.GROQ_API_KEY || process.env.STT_API_KEY;
+    if (groqKey) {
+      this.groq = new Groq({ apiKey: groqKey });
+    }
   }
 
   async generateAnalysis(transcript: NormalizedTranscript, metadata?: YouTubeVideoMetadata, targetLanguage: string = "en"): Promise<VideoAnalysisResult> {
@@ -39,6 +46,8 @@ export class AIProvider implements IAIProvider {
 
     if (this.openAiKey) {
       result = await this.callOpenAIForAnalysis(transcript, metadata, targetLanguage);
+    } else if (this.groq) {
+      result = await this.callGroqForAnalysis(transcript, metadata, targetLanguage);
     } else {
       result = this.generateHeuristicAnalysis(transcript, metadata, targetLanguage);
     }
@@ -58,6 +67,8 @@ export class AIProvider implements IAIProvider {
 
     if (this.openAiKey) {
       script = await this.callOpenAIForScript(transcript, scriptType, metadata, targetLanguage);
+    } else if (this.groq) {
+      script = await this.callGroqForScript(transcript, scriptType, metadata, targetLanguage);
     } else {
       script = this.generateHeuristicScript(transcript, scriptType, metadata, targetLanguage);
     }
@@ -97,6 +108,8 @@ export class AIProvider implements IAIProvider {
   ): Promise<{ answer: string; timestampCitations?: Array<{ timestamp: string; seconds: number; text: string }> }> {
     if (this.openAiKey) {
       return this.callOpenAIForQAWithPersona(transcript, question, persona, language, history);
+    } else if (this.groq) {
+      return this.callGroqForQAWithPersona(transcript, question, persona, language, history);
     }
 
     return this.generateHeuristicQAWithPersona(transcript, question, persona, language);
@@ -246,6 +259,132 @@ export class AIProvider implements IAIProvider {
     const timestampCitations = this.extractTimestampCitations(answer, transcript);
 
     return { answer, timestampCitations };
+  }
+
+  // --- Groq Implementations (Llama 3.3 70B Versatile) ---
+  private async callGroqForAnalysis(transcript: NormalizedTranscript, metadata?: YouTubeVideoMetadata, targetLanguage: string = "en"): Promise<VideoAnalysisResult> {
+    try {
+      const chunks = chunkTranscript(transcript.segments, 3000);
+      const textContext = chunks[0]?.text || transcript.cleanText;
+
+      const langInstruction = targetLanguage === "ur"
+        ? "Write all summaries, key takeaways, topics, and analysis strictly in fluent, natural Urdu (اردو)."
+        : targetLanguage === "hi"
+        ? "Write all summaries and points in Hindi (हिन्दी)."
+        : targetLanguage === "ar"
+        ? "Write all summaries and points in Arabic (العربية)."
+        : targetLanguage === "es"
+        ? "Write all summaries and points in Spanish (Español)."
+        : "";
+
+      const completion = await this.groq!.chat.completions.create({
+        model: "qwen/qwen3.8-27b",
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: `${AI_ANALYSIS_SYSTEM_PROMPT}\n${langInstruction}` },
+          {
+            role: "user",
+            content: `Video Title: ${metadata?.title || "Unknown"}\nChannel: ${metadata?.channelName || "Unknown"}\nDuration: ${transcript.totalDurationSeconds}s\n\nTranscript:\n${textContext}`,
+          },
+        ],
+        temperature: 0.3,
+      });
+
+      const content = completion.choices[0]?.message?.content || "{}";
+      const parsed = JSON.parse(content);
+      return {
+        videoId: transcript.videoId,
+        analyzedAt: new Date().toISOString(),
+        ...parsed,
+      };
+    } catch (e) {
+      console.error("Groq analysis error, falling back to heuristic:", e);
+      return this.generateHeuristicAnalysis(transcript, metadata, targetLanguage);
+    }
+  }
+
+  private async callGroqForScript(transcript: NormalizedTranscript, scriptType: ScriptType, metadata?: YouTubeVideoMetadata, targetLanguage: string = "en"): Promise<GeneratedScript> {
+    try {
+      const prompt = SCRIPT_GENERATION_PROMPTS[scriptType as keyof typeof SCRIPT_GENERATION_PROMPTS] || SCRIPT_GENERATION_PROMPTS.rewritten;
+      const langNote = targetLanguage === "ur" ? " Output the entire script in Urdu (اردو)." : "";
+
+      const completion = await this.groq!.chat.completions.create({
+        model: "qwen/qwen3.8-27b",
+        messages: [
+          { role: "system", content: `${prompt}${langNote}` },
+          {
+            role: "user",
+            content: `Video Title: ${metadata?.title || "Video"}\n\nTranscript Content:\n${transcript.cleanText.slice(0, 12000)}`,
+          },
+        ],
+        temperature: 0.5,
+      });
+
+      const content = completion.choices[0]?.message?.content || "";
+      const wordCount = content.split(/\s+/).filter(Boolean).length;
+
+      return {
+        type: scriptType,
+        title: `${this.formatScriptTypeTitle(scriptType)}: ${metadata?.title || "YouTube Video"}`,
+        estimatedReadTime: `${Math.ceil(wordCount / 130)} min read`,
+        wordCount,
+        content,
+      };
+    } catch (e) {
+      console.error("Groq script error, falling back to heuristic:", e);
+      return this.generateHeuristicScript(transcript, scriptType, metadata, targetLanguage);
+    }
+  }
+
+  private async callGroqForQAWithPersona(
+    transcript: NormalizedTranscript,
+    question: string,
+    persona: AIAssistantPersona,
+    language: string = "en",
+    history?: Array<{ role: string; content: string }>
+  ): Promise<{ answer: string; timestampCitations?: Array<{ timestamp: string; seconds: number; text: string }> }> {
+    try {
+      const searchTerms = question.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
+      const matchedSegments = transcript.segments.filter((s) =>
+        searchTerms.some((term) => s.text.toLowerCase().includes(term))
+      ).slice(0, 10);
+
+      const contextSnippet = matchedSegments.length > 0
+        ? matchedSegments.map((s) => `[${s.startFormatted}] ${s.text}`).join("\n")
+        : transcript.segments.slice(0, 25).map((s) => `[${s.startFormatted}] ${s.text}`).join("\n");
+
+      const langDirective = (language === "ur" || persona.id === "urdu_advisor")
+        ? "Answer fluently and politely in Urdu (اردو). You may use conversational Urdu or Roman Urdu terms where natural. Cite timestamps like [02:30]."
+        : language === "hi"
+        ? "Answer in Hindi (हिन्दी) with timestamp citations."
+        : language === "ar"
+        ? "Answer in Arabic (العربية) with timestamp citations."
+        : "Answer clearly in English with timestamp citations.";
+
+      const completion = await this.groq!.chat.completions.create({
+        model: "qwen/qwen3.8-27b",
+        messages: [
+          {
+            role: "system",
+            content: `${persona.systemPrompt}\n${langDirective}\nGround all answers strictly on the video transcript.`,
+          },
+          ...(history || []).slice(-4) as any,
+          {
+            role: "user",
+            content: `Transcript snippets:\n${contextSnippet}\n\nQuestion: ${question}`,
+          },
+        ],
+        temperature: 0.2,
+      });
+
+      const answer = completion.choices[0]?.message?.content || "";
+      const timestampCitations = this.extractTimestampCitations(answer, transcript);
+
+      return { answer, timestampCitations };
+    } catch (e) {
+      console.error("Groq QA error, falling back to heuristic:", e);
+      return this.generateHeuristicQAWithPersona(transcript, question, persona, language);
+    }
   }
 
   // --- Robust Heuristic NLP Fallback (Instant zero-key multilingual support) ---
