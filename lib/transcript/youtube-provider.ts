@@ -162,11 +162,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
 
   /**
    * Primary transcript retriever with Multi-Tier Fast Fallback:
-   * Tier 1: Direct InnerTube (Direct connection)
-   * Tier 2: youtube-transcript Library
-   * Tier 3: InnerTube with Proxy (if configured)
-   * Tier 4: RapidAPI YouTube Transcript API (if configured)
-   * Tier 5: Groq Whisper AI Speech-to-Text Fallback
+   * Tier 1: Direct YoutubeTranscript Library
+   * Tier 2: Direct InnerTube (Android/iOS/Web clients)
+   * Tier 3: Direct Webpage HTML extraction
+   * Tier 4: Proxy-based extraction (if proxy configured)
+   * Tier 5: RapidAPI YouTube Transcript API (if configured)
+   * Tier 6: Groq Whisper AI Speech-to-Text Fallback
    */
   async getTranscript(videoId: string, languageCode?: string): Promise<NormalizedTranscript> {
     let rawItems: RawTranscriptItem[] = [];
@@ -174,50 +175,69 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
     const traces: string[] = [];
 
     // ----------------------------------------------------
-    // Tier 1: Direct InnerTube (Fast Direct Connection)
+    // Tier 1: Direct YoutubeTranscript Library
     // ----------------------------------------------------
     try {
-      const directFetch = getCustomFetch(false);
-      const innerTubeItems = await this.fetchFromInnerTubeDirect(videoId, languageCode, directFetch);
-      if (innerTubeItems && innerTubeItems.items.length > 0) {
-        rawItems = innerTubeItems.items;
-        detectedLang = innerTubeItems.lang;
-        traces.push("Tier 1 (Direct InnerTube): SUCCESS");
+      const transcriptData = await YoutubeTranscript.fetchTranscript(videoId, {
+        ...(languageCode && languageCode !== "auto" ? { lang: languageCode } : {}),
+      });
+
+      if (transcriptData && transcriptData.length > 0) {
+        rawItems = transcriptData.map((item) => ({
+          text: item.text,
+          duration: item.duration,
+          offset: item.offset,
+          lang: item.lang || languageCode || "en",
+        }));
+        detectedLang = transcriptData[0]?.lang || languageCode || "en";
+        traces.push("Tier 1 (YoutubeTranscript Direct): SUCCESS");
       } else {
-        traces.push("Tier 1 (Direct InnerTube): No tracks returned");
+        traces.push("Tier 1 (YoutubeTranscript Direct): Empty items");
       }
-    } catch (e: any) {
-      traces.push(`Tier 1 (Direct InnerTube): ${e?.message || "Failed"}`);
+    } catch (err: any) {
+      traces.push(`Tier 1 (YoutubeTranscript Direct): ${err?.message || "Failed"}`);
     }
 
     // ----------------------------------------------------
-    // Tier 2: youtube-transcript Library (Direct)
+    // Tier 2: Direct InnerTube (Android / iOS / Web)
     // ----------------------------------------------------
     if (rawItems.length === 0) {
       try {
-        const transcriptData = await YoutubeTranscript.fetchTranscript(videoId, {
-          ...(languageCode && languageCode !== "auto" ? { lang: languageCode } : {}),
-        });
-
-        if (transcriptData && transcriptData.length > 0) {
-          rawItems = transcriptData.map((item) => ({
-            text: item.text,
-            duration: item.duration,
-            offset: item.offset,
-            lang: item.lang || languageCode || "en",
-          }));
-          detectedLang = transcriptData[0]?.lang || languageCode || "en";
-          traces.push("Tier 2 (youtube-transcript): SUCCESS");
+        const directFetch = getCustomFetch(false);
+        const innerTubeItems = await this.fetchFromInnerTubeDirect(videoId, languageCode, directFetch);
+        if (innerTubeItems && innerTubeItems.items.length > 0) {
+          rawItems = innerTubeItems.items;
+          detectedLang = innerTubeItems.lang;
+          traces.push("Tier 2 (Direct InnerTube): SUCCESS");
         } else {
-          traces.push("Tier 2 (youtube-transcript): Empty items");
+          traces.push("Tier 2 (Direct InnerTube): No tracks returned");
         }
-      } catch (libErr: any) {
-        traces.push(`Tier 2 (youtube-transcript): ${libErr?.message || "Failed"}`);
+      } catch (e: any) {
+        traces.push(`Tier 2 (Direct InnerTube): ${e?.message || "Failed"}`);
       }
     }
 
     // ----------------------------------------------------
-    // Tier 3: Proxy InnerTube (If proxy configured)
+    // Tier 3: Direct Webpage HTML extraction
+    // ----------------------------------------------------
+    if (rawItems.length === 0) {
+      try {
+        const directFetch = getCustomFetch(false);
+        const htmlItems = await this.fetchFromWebPageDirect(videoId, languageCode, directFetch);
+        if (htmlItems && htmlItems.items.length > 0) {
+          rawItems = htmlItems.items;
+          detectedLang = htmlItems.lang;
+          traces.push("Tier 3 (WebPage HTML): SUCCESS");
+        } else {
+          traces.push("Tier 3 (WebPage HTML): No tracks returned");
+        }
+      } catch (htmlErr: any) {
+        traces.push(`Tier 3 (WebPage HTML): ${htmlErr?.message || "Failed"}`);
+      }
+    }
+
+    // ----------------------------------------------------
+    // Tier 4: Proxy InnerTube (If proxy configured)
     // ----------------------------------------------------
     const hasProxy = Boolean(process.env.YOUTUBE_PROXY || process.env.HTTPS_PROXY);
     if (rawItems.length === 0 && hasProxy) {
@@ -227,17 +247,17 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
         if (proxyItems && proxyItems.items.length > 0) {
           rawItems = proxyItems.items;
           detectedLang = proxyItems.lang;
-          traces.push("Tier 3 (Proxy InnerTube): SUCCESS");
+          traces.push("Tier 4 (Proxy InnerTube): SUCCESS");
         } else {
-          traces.push("Tier 3 (Proxy InnerTube): No tracks returned");
+          traces.push("Tier 4 (Proxy InnerTube): No tracks returned");
         }
       } catch (proxyErr: any) {
-        traces.push(`Tier 3 (Proxy InnerTube): ${proxyErr?.message || "Failed"}`);
+        traces.push(`Tier 4 (Proxy InnerTube): ${proxyErr?.message || "Failed"}`);
       }
     }
 
     // ----------------------------------------------------
-    // Tier 4: RapidAPI YouTube Transcript API Fallback
+    // Tier 5: RapidAPI YouTube Transcript API Fallback
     // ----------------------------------------------------
     if (rawItems.length === 0) {
       const rapidApiKey = process.env.RAPIDAPI_KEY || process.env.YOUTUBE_API_KEY;
@@ -247,12 +267,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
           if (rapidItems && rapidItems.items.length > 0) {
             rawItems = rapidItems.items;
             detectedLang = rapidItems.lang;
-            traces.push("Tier 4 (RapidAPI): SUCCESS");
+            traces.push("Tier 5 (RapidAPI): SUCCESS");
           } else {
-            traces.push("Tier 4 (RapidAPI): Empty response");
+            traces.push("Tier 5 (RapidAPI): Empty response");
           }
         } catch (rapidErr: any) {
-          traces.push(`Tier 4 (RapidAPI): ${rapidErr?.message || "Failed"}`);
+          traces.push(`Tier 5 (RapidAPI): ${rapidErr?.message || "Failed"}`);
         }
       }
     }
@@ -269,23 +289,23 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
     }
 
     // ----------------------------------------------------
-    // Tier 5: Groq Whisper AI Fallback
+    // Tier 6: Groq Whisper AI Fallback
     // ----------------------------------------------------
     const hasGroqKey = Boolean(process.env.GROQ_API_KEY || process.env.STT_API_KEY);
     if (hasGroqKey) {
       try {
-        console.log("[Transcript Tier 5] Engaging Groq Whisper AI Speech-to-Text fallback...");
+        console.log("[Transcript Tier 6] Engaging Groq Whisper AI Speech-to-Text fallback...");
         const { SpeechToTextFallbackProvider } = await import("./speech-to-text-provider");
         const sttProvider = new SpeechToTextFallbackProvider();
         const result = await sttProvider.transcribeVideo(videoId, languageCode);
-        traces.push("Tier 5 (Groq STT): SUCCESS");
+        traces.push("Tier 6 (Groq STT): SUCCESS");
         return result;
       } catch (sttErr: any) {
-        traces.push(`Tier 5 (Groq STT): ${sttErr?.message || "Failed"}`);
-        console.error("[Transcript Tier 5] Groq Whisper fallback error:", sttErr?.message || sttErr);
+        traces.push(`Tier 6 (Groq STT): ${sttErr?.message || "Failed"}`);
+        console.error("[Transcript Tier 6] Groq Whisper fallback error:", sttErr?.message || sttErr);
       }
     } else {
-      traces.push("Tier 5 (Groq STT): SKIPPED (GROQ_API_KEY not configured in environment)");
+      traces.push("Tier 6 (Groq STT): SKIPPED (GROQ_API_KEY not configured in environment)");
     }
 
     // ----------------------------------------------------
@@ -396,6 +416,79 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
         // Try next client
       }
     }
+
+    return null;
+  }
+
+  /**
+   * Scrapes webpage HTML directly for ytInitialPlayerResponse
+   */
+  private async fetchFromWebPageDirect(
+    videoId: string,
+    requestedLang: string | undefined,
+    customFetch: typeof fetch
+  ): Promise<{ items: RawTranscriptItem[]; lang: string } | null> {
+    try {
+      const url = `https://www.youtube.com/watch?v=${videoId}`;
+      const res = await customFetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept-Language": requestedLang && requestedLang !== "auto" ? requestedLang : "en-US,en;q=0.9",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+
+      if (!res.ok) return null;
+      const html = await res.text();
+
+      const startToken = "var ytInitialPlayerResponse = ";
+      const idx = html.indexOf(startToken);
+      if (idx === -1) return null;
+
+      const jsonStart = idx + startToken.length;
+      let depth = 0;
+      let jsonEnd = -1;
+      for (let i = jsonStart; i < html.length; i++) {
+        if (html[i] === "{") depth++;
+        else if (html[i] === "}") {
+          depth--;
+          if (depth === 0) {
+            jsonEnd = i + 1;
+            break;
+          }
+        }
+      }
+
+      if (jsonEnd === -1) return null;
+      const data = JSON.parse(html.slice(jsonStart, jsonEnd));
+      const captionTracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (!Array.isArray(captionTracks) || captionTracks.length === 0) return null;
+
+      let selectedTrack = captionTracks[0];
+      if (requestedLang && requestedLang !== "auto") {
+        const match = captionTracks.find((t) => t.languageCode === requestedLang);
+        if (match) selectedTrack = match;
+      }
+
+      if (!selectedTrack?.baseUrl) return null;
+
+      const captionRes = await customFetch(selectedTrack.baseUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept": "*/*",
+        },
+        signal: AbortSignal.timeout(4000),
+      });
+
+      if (!captionRes.ok) return null;
+      const xml = await captionRes.text();
+      const items = this.parseTimedTextXml(xml, selectedTrack.languageCode || "en");
+
+      if (items.length > 0) {
+        return { items, lang: selectedTrack.languageCode || "en" };
+      }
+    } catch (e) {}
 
     return null;
   }
