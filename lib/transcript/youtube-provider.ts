@@ -374,11 +374,12 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
 
         if (!selectedTrack?.baseUrl) continue;
 
-        // Fetch TimedText XML
+        // Fetch TimedText XML with browser headers
         const captionRes = await customFetch(selectedTrack.baseUrl, {
           headers: {
-            "User-Agent": client.userAgent,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
           },
           signal: AbortSignal.timeout(4000),
         });
