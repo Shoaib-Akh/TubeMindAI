@@ -559,29 +559,44 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
     apiKey: string
   ): Promise<{ items: RawTranscriptItem[]; lang: string } | null> {
     try {
-      const url = `https://youtube-transcriptor.p.rapidapi.com/transcript?video_id=${videoId}&lang=${languageCode || "en"}`;
+      const lang = languageCode && languageCode !== "auto" ? languageCode : "en";
+      const url = `https://youtube-transcriptor.p.rapidapi.com/transcript?video_id=${videoId}&lang=${lang}`;
       const res = await fetch(url, {
         headers: {
           "x-rapidapi-key": apiKey,
           "x-rapidapi-host": "youtube-transcriptor.p.rapidapi.com",
         },
-        signal: AbortSignal.timeout(4000),
+        signal: AbortSignal.timeout(8000),
       });
 
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          const items: RawTranscriptItem[] = data.map((d: any) => ({
-            text: d.text || d.subtitle || "",
-            offset: typeof d.start === "number" ? Math.round(d.start * 1000) : (d.offset || 0),
-            duration: typeof d.duration === "number" ? Math.round(d.duration * 1000) : (d.duration || 2500),
-            lang: languageCode || "en",
+        const root = Array.isArray(data) ? data[0] : data;
+        const transcriptArray =
+          root?.transcription ||
+          root?.transcript ||
+          (Array.isArray(data) && data[0]?.subtitle ? data : []);
+
+        if (Array.isArray(transcriptArray) && transcriptArray.length > 0) {
+          const items: RawTranscriptItem[] = transcriptArray.map((d: any) => ({
+            text: d.subtitle || d.text || "",
+            offset:
+              typeof d.start === "number"
+                ? Math.round(d.start * 1000)
+                : Math.round(parseFloat(d.start || "0") * 1000) || 0,
+            duration:
+              typeof d.dur === "number"
+                ? Math.round(d.dur * 1000)
+                : typeof d.duration === "number"
+                ? Math.round(d.duration * 1000)
+                : Math.round(parseFloat(d.dur || d.duration || "2.5") * 1000) || 2500,
+            lang: lang,
           }));
-          return { items, lang: languageCode || "en" };
+          return { items, lang };
         }
       }
-    } catch (e) {
-      // RapidAPI fallback failed
+    } catch (e: any) {
+      console.warn("[RapidAPI] Fetch failed:", e?.message);
     }
     return null;
   }
