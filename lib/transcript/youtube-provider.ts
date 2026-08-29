@@ -558,19 +558,38 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
     languageCode: string | undefined,
     apiKey: string
   ): Promise<{ items: RawTranscriptItem[]; lang: string } | null> {
-    try {
-      const lang = languageCode && languageCode !== "auto" ? languageCode : "en";
-      const url = `https://youtube-transcriptor.p.rapidapi.com/transcript?video_id=${videoId}&lang=${lang}`;
-      const res = await fetch(url, {
-        headers: {
-          "x-rapidapi-key": apiKey,
-          "x-rapidapi-host": "youtube-transcriptor.p.rapidapi.com",
-        },
-        signal: AbortSignal.timeout(8000),
-      });
+    const fetchWithLang = async (targetLang: string) => {
+      try {
+        const url = `https://youtube-transcriptor.p.rapidapi.com/transcript?video_id=${videoId}&lang=${targetLang}`;
+        const res = await fetch(url, {
+          headers: {
+            "x-rapidapi-key": apiKey,
+            "x-rapidapi-host": "youtube-transcriptor.p.rapidapi.com",
+          },
+          signal: AbortSignal.timeout(8000),
+        });
 
-      if (res.ok) {
+        if (!res.ok) return null;
         const data = await res.json();
+        return data;
+      } catch (e: any) {
+        return null;
+      }
+    };
+
+    try {
+      let currentLang = languageCode && languageCode !== "auto" ? languageCode : "en";
+      let data = await fetchWithLang(currentLang);
+
+      // If requested language is not available, check if RapidAPI returned availableLangs
+      if (data?.availableLangs && Array.isArray(data.availableLangs) && data.availableLangs.length > 0) {
+        if (!data.availableLangs.includes(currentLang)) {
+          currentLang = data.availableLangs[0];
+          data = await fetchWithLang(currentLang);
+        }
+      }
+
+      if (data) {
         const root = Array.isArray(data) ? data[0] : data;
         const transcriptArray =
           root?.transcription ||
@@ -590,9 +609,9 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
                 : typeof d.duration === "number"
                 ? Math.round(d.duration * 1000)
                 : Math.round(parseFloat(d.dur || d.duration || "2.5") * 1000) || 2500,
-            lang: lang,
+            lang: currentLang,
           }));
-          return { items, lang };
+          return { items, lang: currentLang };
         }
       }
     } catch (e: any) {
