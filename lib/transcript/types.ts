@@ -1,4 +1,4 @@
-import { YouTubeVideoMetadata } from "@/types/youtube";
+import { YouTubeVideoMetadata } from "@/types/youtube" ; 
 import { NormalizedTranscript } from "@/types/transcript";
 
 export interface ITranscriptProvider {
