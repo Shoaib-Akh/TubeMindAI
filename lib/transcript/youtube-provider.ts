@@ -175,27 +175,60 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
     const traces: string[] = [];
 
     // ----------------------------------------------------
+    // Tier 0: Self-Hosted Transcript Microservice (If configured)
+    // ----------------------------------------------------
+    const customServiceUrl = process.env.CUSTOM_TRANSCRIPT_API_URL || process.env.TRANSCRIPT_SERVICE_URL;
+    if (customServiceUrl) {
+      try {
+        const cleanBaseUrl = customServiceUrl.replace(/\/+$/, "");
+        const serviceUrl = `${cleanBaseUrl}/api/transcript?videoId=${videoId}&lang=${languageCode || "auto"}`;
+        const serviceRes = await fetch(serviceUrl, {
+          headers: { "Accept": "application/json" },
+          signal: AbortSignal.timeout(8000),
+        });
+
+        if (serviceRes.ok) {
+          const serviceData = await serviceRes.json();
+          if (serviceData.success && Array.isArray(serviceData.segments) && serviceData.segments.length > 0) {
+            rawItems = serviceData.segments.map((s: any) => ({
+              text: s.text,
+              offset: s.offset || Math.round((s.start || 0) * 1000),
+              duration: s.dur || Math.round((s.duration || 2.5) * 1000),
+              lang: serviceData.language || languageCode || "en",
+            }));
+            detectedLang = serviceData.language || languageCode || "en";
+            traces.push("Tier 0 (Custom Microservice): SUCCESS");
+          }
+        }
+      } catch (svcErr: any) {
+        traces.push(`Tier 0 (Custom Microservice): ${svcErr?.message || "Failed"}`);
+      }
+    }
+
+    // ----------------------------------------------------
     // Tier 1: Direct YoutubeTranscript Library
     // ----------------------------------------------------
-    try {
-      const transcriptData = await YoutubeTranscript.fetchTranscript(videoId, {
-        ...(languageCode && languageCode !== "auto" ? { lang: languageCode } : {}),
-      });
+    if (rawItems.length === 0) {
+      try {
+        const transcriptData = await YoutubeTranscript.fetchTranscript(videoId, {
+          ...(languageCode && languageCode !== "auto" ? { lang: languageCode } : {}),
+        });
 
-      if (transcriptData && transcriptData.length > 0) {
-        rawItems = transcriptData.map((item) => ({
-          text: item.text,
-          duration: item.duration,
-          offset: item.offset,
-          lang: item.lang || languageCode || "en",
-        }));
-        detectedLang = transcriptData[0]?.lang || languageCode || "en";
-        traces.push("Tier 1 (YoutubeTranscript Direct): SUCCESS");
-      } else {
-        traces.push("Tier 1 (YoutubeTranscript Direct): Empty items");
+        if (transcriptData && transcriptData.length > 0) {
+          rawItems = transcriptData.map((item) => ({
+            text: item.text,
+            duration: item.duration,
+            offset: item.offset,
+            lang: item.lang || languageCode || "en",
+          }));
+          detectedLang = transcriptData[0]?.lang || languageCode || "en";
+          traces.push("Tier 1 (YoutubeTranscript Direct): SUCCESS");
+        } else {
+          traces.push("Tier 1 (YoutubeTranscript Direct): Empty items");
+        }
+      } catch (err: any) {
+        traces.push(`Tier 1 (YoutubeTranscript Direct): ${err?.message || "Failed"}`);
       }
-    } catch (err: any) {
-      traces.push(`Tier 1 (YoutubeTranscript Direct): ${err?.message || "Failed"}`);
     }
 
     // ----------------------------------------------------
