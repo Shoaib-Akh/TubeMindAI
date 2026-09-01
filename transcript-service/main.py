@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+from youtube_transcript_api import YouTubeTranscriptApi
 import os
 import uvicorn
 
@@ -17,7 +17,16 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
+    )
+
+def get_transcript_list_universal(video_id: str):
+    """Compatible with both youtube-transcript-api 0.6.x and 1.x"""
+    if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
+        return YouTubeTranscriptApi.list_transcripts(video_id)
+    api = YouTubeTranscriptApi() if callable(YouTubeTranscriptApi) else YouTubeTranscriptApi
+    if hasattr(api, 'list'):
+        return api.list(video_id)
+    raise Exception("Could not find list_transcripts method on YouTubeTranscriptApi")
 
 @app.get("/")
 def health_check():
@@ -41,7 +50,7 @@ def get_transcript(
 
     try:
         # 1. List all available transcripts (manual & auto-generated)
-        transcript_list = YouTubeTranscriptApi.list_transcripts(videoId)
+        transcript_list = get_transcript_list_universal(videoId)
         
         selected_transcript = None
         detected_lang = "en"
@@ -59,12 +68,12 @@ def get_transcript(
             preferred_langs = ['en', 'hi', 'ur', 'es', 'fr', 'de', 'ar', 'pt', 'ru', 'ja', 'zh-Hans']
             try:
                 selected_transcript = transcript_list.find_transcript(preferred_langs)
-                detected_lang = selected_transcript.language_code
+                detected_lang = getattr(selected_transcript, 'language_code', 'en')
             except Exception:
                 # Fallback: grab the first available transcript
                 for t in transcript_list:
                     selected_transcript = t
-                    detected_lang = t.language_code
+                    detected_lang = getattr(t, 'language_code', 'en')
                     break
 
         if not selected_transcript:
@@ -78,13 +87,18 @@ def get_transcript(
         full_text_list = []
         
         for item in raw_items:
-            text = item.get("text", "").strip()
+            if isinstance(item, dict):
+                text = item.get("text", "").strip()
+                start = float(item.get("start", 0.0))
+                duration = float(item.get("duration", 2.5))
+            else:
+                text = getattr(item, "text", "").strip()
+                start = float(getattr(item, "start", 0.0))
+                duration = float(getattr(item, "duration", 2.5))
+
             if not text:
                 continue
                 
-            start = item.get("start", 0.0)
-            duration = item.get("duration", 2.5)
-            
             segments.append({
                 "text": text,
                 "start": start,
@@ -94,24 +108,29 @@ def get_transcript(
             })
             full_text_list.append(text)
 
+        is_gen = getattr(selected_transcript, 'is_generated', True)
+
         return {
             "success": True,
             "videoId": videoId,
             "language": detected_lang,
-            "isGenerated": selected_transcript.is_generated,
+            "isGenerated": is_gen,
             "totalSegments": len(segments),
             "segments": segments,
             "fullText": " ".join(full_text_list)
         }
 
-    except TranscriptsDisabled:
-        raise HTTPException(status_code=422, detail="Subtitles and transcripts are disabled for this video.")
-    except NoTranscriptFound:
-        raise HTTPException(status_code=404, detail="No transcript found matching the requested criteria.")
-    except VideoUnavailable:
-        raise HTTPException(status_code=404, detail="This YouTube video is unavailable or private.")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcript extraction error: {str(e)}")
+        err_msg = str(e)
+        if "TranscriptsDisabled" in err_msg or "Subtitles are disabled" in err_msg:
+            raise HTTPException(status_code=422, detail="Subtitles and transcripts are disabled for this video.")
+        if "NoTranscriptFound" in err_msg:
+            raise HTTPException(status_code=404, detail="No transcript found matching the requested criteria.")
+        if "VideoUnavailable" in err_msg:
+            raise HTTPException(status_code=404, detail="This YouTube video is unavailable or private.")
+        raise HTTPException(status_code=500, detail=f"Transcript extraction error: {err_msg}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
