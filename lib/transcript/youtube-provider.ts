@@ -184,7 +184,7 @@ export class YouTubeTranscriptProvider implements ITranscriptProvider {
         const serviceUrl = `${cleanBaseUrl}/api/transcript?videoId=${videoId}&lang=${languageCode || "auto"}`;
         const serviceRes = await fetch(serviceUrl, {
           headers: { "Accept": "application/json" },
-          signal: AbortSignal.timeout(8000),
+          signal: AbortSignal.timeout(25000),
         });
 
         if (serviceRes.ok) {
