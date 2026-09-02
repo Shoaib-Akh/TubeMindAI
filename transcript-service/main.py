@@ -6,6 +6,10 @@ import requests
 import xml.etree.ElementTree as ET
 import uvicorn
 import html
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tubemind-transcript")
 
 app = FastAPI(
     title="TubeMind YouTube Transcript Microservice",
@@ -30,8 +34,8 @@ def get_proxy_dict():
 
 def fetch_innertube_captions(video_id: str, lang_req: str = "auto"):
     """
-    Direct InnerTube Android Client request.
-    Works seamlessly and bypasses typical cloud web-client blocks.
+    Direct InnerTube Android/iOS Client request.
+    Extracts captions directly from timedtext XML.
     """
     clients = [
         {
@@ -67,13 +71,15 @@ def fetch_innertube_captions(video_id: str, lang_req: str = "auto"):
                 "videoId": video_id
             }
             
-            r = requests.post(url, json=payload, headers=headers, proxies=proxies, timeout=8)
+            r = requests.post(url, json=payload, headers=headers, proxies=proxies, timeout=10)
             if r.status_code != 200:
+                logger.warning(f"[{client['clientName']}] Status code: {r.status_code}")
                 continue
                 
             data = r.json()
             caption_tracks = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
             if not caption_tracks:
+                logger.info(f"[{client['clientName']}] No captionTracks found in player response")
                 continue
                 
             # Pick requested language or first available
@@ -91,8 +97,9 @@ def fetch_innertube_captions(video_id: str, lang_req: str = "auto"):
             detected_lang = selected_track.get("languageCode", "en")
             
             # Fetch timedtext XML
-            res = requests.get(base_url, headers={"User-Agent": "Mozilla/5.0"}, proxies=proxies, timeout=8)
+            res = requests.get(base_url, headers={"User-Agent": "Mozilla/5.0"}, proxies=proxies, timeout=10)
             if res.status_code != 200 or not res.text:
+                logger.warning(f"Timedtext status code: {res.status_code}")
                 continue
                 
             root = ET.fromstring(res.text)
@@ -147,6 +154,7 @@ def fetch_innertube_captions(video_id: str, lang_req: str = "auto"):
                         full_text.append(line)
                         
             if segments:
+                logger.info(f"[{client['clientName']}] Successfully extracted {len(segments)} segments")
                 return {
                     "success": True,
                     "videoId": video_id,
@@ -156,7 +164,8 @@ def fetch_innertube_captions(video_id: str, lang_req: str = "auto"):
                     "segments": segments,
                     "fullText": " ".join(full_text)
                 }
-        except Exception:
+        except Exception as e:
+            logger.error(f"[{client['clientName']}] InnerTube Error: {e}")
             continue
             
     return None
@@ -260,8 +269,8 @@ def get_transcript(
                 "fullText": " ".join(full_text_list)
             }
 
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"YouTubeTranscriptApi error: {e}")
 
     raise HTTPException(status_code=404, detail="No transcript found for this video.")
 
